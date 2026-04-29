@@ -1,0 +1,17 @@
+langchain
+langchain-openai
+langchain-community
+langgraph
+fastapi
+uvicorn[standard]
+python-multipart
+faiss-cpu
+pypdf
+python-docx
+docx2txt
+tiktoken
+python-dotenv
+pdf2image
+pytesseract
+pillow
+rank-bm25
