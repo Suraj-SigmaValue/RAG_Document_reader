@@ -1,6 +1,8 @@
 "use client";
 
 import { FormEvent, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type UploadResult = {
   document_name: string;
@@ -13,7 +15,11 @@ type UploadResult = {
 type Chunk = {
   source: string;
   page: string;
-  content: string;
+  type?: "text" | "table" | "image";
+  content?: string;
+  image_base64?: string;
+  image_mime?: string;
+  relevance_score?: number;
 };
 
 type AskResult = {
@@ -31,63 +37,33 @@ const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
   "http://localhost:8080";
 
-function formatInlineMarkdown(text: string) {
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => {
-    if (part.startsWith("**") && part.endsWith("**")) {
-      return <strong key={index}>{part.slice(2, -2)}</strong>;
-    }
-
-    return part;
-  });
-}
-
 function MarkdownAnswer({ content }: { content: string }) {
-  const blocks = content
-    .replace(/\r\n/g, "\n")
-    .split(/\n{2,}/)
-    .map((block) => block.trim())
-    .filter(Boolean);
-
   return (
     <div className="answer-markdown">
-      {blocks.map((block, index) => {
-        const heading = block.match(/^(#{1,6})\s+(.+)$/);
-        if (heading) {
-          const level = Math.min(heading[1].length + 2, 4);
-          const HeadingTag = `h${level}` as keyof JSX.IntrinsicElements;
-          return <HeadingTag key={index}>{formatInlineMarkdown(heading[2])}</HeadingTag>;
-        }
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          img: ({ src, alt }) => {
+            if (!src) {
+              return null;
+            }
 
-        const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
-        const allListItems = lines.every((line) => /^(\d+\.\s+|-+\s+)/.test(line));
-
-        if (allListItems) {
-          const ordered = lines.every((line) => /^\d+\.\s+/.test(line));
-          const ListTag = ordered ? "ol" : "ul";
-          return (
-            <ListTag key={index}>
-              {lines.map((line, lineIndex) => (
-                <li key={lineIndex}>
-                  {formatInlineMarkdown(line.replace(/^(\d+\.\s+|-+\s+)/, ""))}
-                </li>
-              ))}
-            </ListTag>
-          );
-        }
-
-        return (
-          <p key={index}>
-            {lines.map((line, lineIndex) => (
-              <span key={lineIndex}>
-                {formatInlineMarkdown(line)}
-                {lineIndex < lines.length - 1 ? <br /> : null}
-              </span>
-            ))}
-          </p>
-        );
-      })}
+            return <img src={src} alt={alt || ""} />;
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
+}
+
+function chunkImageSrc(chunk: Chunk) {
+  if (!chunk.image_base64) {
+    return "";
+  }
+
+  return `data:${chunk.image_mime || "image/png"};base64,${chunk.image_base64}`;
 }
 
 export default function Home() {
@@ -101,6 +77,10 @@ export default function Home() {
   const tokenUsage = useMemo<TokenUsage>(() => {
     return askResult?.token_usage || uploadResult?.token_usage || { input: 0, output: 0 };
   }, [askResult, uploadResult]);
+
+  const answerImages = useMemo(() => {
+    return askResult?.chunks.filter((chunk) => chunk.type === "image" && chunk.image_base64) || [];
+  }, [askResult]);
 
   async function parseError(response: Response) {
     try {
@@ -242,6 +222,25 @@ export default function Home() {
               <h2>Answer</h2>
               <MarkdownAnswer content={askResult.answer} />
 
+              {answerImages.length ? (
+                <section className="visual-references" aria-label="Visual references">
+                  <h3>Supporting Images</h3>
+                  <div className="image-grid">
+                    {answerImages.map((chunk, index) => (
+                      <figure key={`${chunk.page}-${index}`} className="answer-image">
+                        <img
+                          src={chunkImageSrc(chunk)}
+                          alt={`Supporting image from page ${chunk.page}`}
+                        />
+                        <figcaption>
+                          {chunk.source} · Page {chunk.page}
+                        </figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+
               <details>
                 <summary>Retrieved Source Chunks</summary>
                 <div className="chunks">
@@ -251,7 +250,16 @@ export default function Home() {
                         <span className="chunk-source">{chunk.source}</span>
                         <span className="chunk-page">Page {chunk.page}</span>
                       </div>
-                      <p className="chunk-content">{chunk.content}</p>
+                      {chunk.type === "image" && chunk.image_base64 ? (
+                        <figure className="chunk-image">
+                          <img
+                            src={chunkImageSrc(chunk)}
+                            alt={`Retrieved image from page ${chunk.page}`}
+                          />
+                        </figure>
+                      ) : (
+                        <p className="chunk-content">{chunk.content}</p>
+                      )}
                     </div>
                   ))}
                 </div>

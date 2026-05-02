@@ -1,6 +1,10 @@
 import os
 import tempfile
 from typing import List, Optional, TypedDict
+import re
+from langchain_core.documents import Document
+import fitz  # PyMuPDF
+import base64
 
 import tiktoken
 from dotenv import load_dotenv
@@ -35,6 +39,7 @@ class RagRuntime:
     def __init__(self) -> None:
         self.faiss_index = None  # FAISS index for similarity search
         self.chunks = []  # Store chunks for retrieval
+        self.page_images = {}
         self.bm25_retriever = None
         self.document_name: Optional[str] = None
         self.chunk_count = 0
@@ -69,6 +74,38 @@ class GraphState(TypedDict):
     question: str
     context: List[dict]
     answer: str
+
+def extract_images_from_pdf(file_path):
+    doc = fitz.open(file_path)
+    image_docs = []
+
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        images = page.get_images(full=True)
+
+        for img_index, img in enumerate(images):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image.get("ext", "png")
+
+            # Convert to base64 (for UI display)
+            encoded = base64.b64encode(image_bytes).decode("utf-8")
+
+            image_docs.append(
+                Document(
+                    page_content="[IMAGE]",
+                    metadata={
+                        "page": page_index + 1,
+                        "image_base64": encoded,
+                        "image_mime": f"image/{image_ext}",
+                        "image_index": img_index,
+                        "type": "image"
+                    }
+                )
+            )
+
+    return image_docs
 
 
 def require_openai_key() -> None:
@@ -112,6 +149,11 @@ def load_documents(file_path: str, filename: str) -> List[Document]:
             from langchain_community.document_loaders import PyPDFLoader
             loader = PyPDFLoader(file_path)
             docs = loader.load()
+            for doc in docs:
+                metadata = doc.metadata or {}   # ✅ MUST come first
+                page = doc.metadata.get("page")
+                if isinstance(page, int):
+                    doc.metadata["page"] = page + 1
             total_text = " ".join(doc.page_content for doc in docs)
             if len(total_text.strip()) > 500:
                 return docs
@@ -210,32 +252,270 @@ def create_hybrid_retriever(chunks: List[Document], vector_weight: float = 0.6, 
     
     return hybrid_search
 
+def is_table_like(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    if len(lines) < 3:
+        return False
+
+    table_keywords = [
+        "table no", "sr. no", "occupancy"
+    ]
+
+    keyword_hit = any(k in text.lower() for k in table_keywords)
+
+    numeric_lines = sum(1 for line in lines if re.search(r"\d", line))
+    numeric_ratio = numeric_lines / len(lines)
+
+    column_like_lines = sum(
+        1 for line in lines
+        if len(re.split(r"\s{2,}|\t", line)) >= 2
+    )
+
+    return keyword_hit or numeric_ratio > 0.35 or column_like_lines >= 3
+
+def is_toc_like(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+
+    toc_line_count = 0
+    for line in lines:
+        has_section = re.match(r"^\d+(?:\.\d+)*\s+", line)
+        ends_with_page = re.search(r"(?:\.{2,}\s*|\s+)\d{1,4}$", line)
+        if has_section and ends_with_page:
+            toc_line_count += 1
+
+    return (toc_line_count / len(lines)) >= 0.5
+
+
+def section_roots_from_toc(docs: List[Document]) -> List[str]:
+    section_ids = []
+
+    for doc in docs:
+        if not is_toc_like(doc.page_content):
+            continue
+
+        section_ids.extend(re.findall(r"\b(\d+(?:\.\d+){1,4})\b", doc.page_content))
+
+    roots = []
+    for section_id in section_ids:
+        parts = section_id.split(".")
+        root = ".".join(parts[:2]) if len(parts) > 2 else section_id
+        if root not in roots:
+            roots.append(root)
+
+    return roots
+
+
+def expand_section_docs_from_toc(docs: List[Document], max_extra: int = 18) -> List[Document]:
+    roots = section_roots_from_toc(docs)
+    if not roots:
+        return []
+
+    expanded_docs = []
+    seen = set()
+
+    for chunk in runtime.chunks:
+        section = str(chunk.metadata.get("section") or "")
+        if not section:
+            continue
+
+        matches_root = any(section == root or section.startswith(f"{root}.") for root in roots)
+        if not matches_root or is_toc_like(chunk.page_content):
+            continue
+
+        key = (chunk.metadata.get("page"), section, chunk.page_content[:120])
+        if key in seen:
+            continue
+
+        expanded_docs.append(chunk)
+        seen.add(key)
+
+        if len(expanded_docs) >= max_extra:
+            break
+
+    return expanded_docs
+
+
+def structure_based_split(documents):
+    structured_chunks = []
+
+    # section_pattern = r"\n(?=\d+(?:\.\d+)*)"
+    section_pattern = r"\n(?=\d+\.\d+(?:\.\d+)*\s+[A-Z][A-Za-z ]{4,80})"
+
+    for doc in documents:
+        if doc.metadata.get("type") == "image":
+            structured_chunks.append(doc)
+            continue
+
+        text = doc.page_content
+        page = doc.metadata.get("page", None)
+
+        # Split by sections like 1., 1.1, 4.3 etc.
+        sections = re.split(section_pattern, text)
+
+        for sec in sections:
+            sec = sec.strip()
+            if not sec:
+                continue
+
+            # Extract section number/title
+            match = re.match(r"(\d+(\.\d+)*)\s*(.*)", sec)
+
+            section_id = match.group(1) if match else None
+            title = match.group(3)[:100] if match else None
+
+            structured_chunks.append(
+                Document(
+                    page_content=sec,
+                    metadata={
+                        "page": page,
+                        "source": doc.metadata.get("source", runtime.document_name or "document"),
+                        "section": section_id,
+                        "title": title,
+                        "chunk_type": "section",
+                        "is_table": is_table_like(sec) 
+                    }
+                )
+            )
+
+    return structured_chunks
+
+def hybrid_chunking(documents):
+    structured_docs = structure_based_split(documents)
+    final_chunks = []
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2000,
+        chunk_overlap=400,
+        separators=["\n\n", "\n", ". ", "; ", " ", ""],
+    )
+
+    for doc in structured_docs:
+        if doc.metadata.get("type") == "image":
+            final_chunks.append(doc)
+            continue
+
+        if len(doc.page_content) > 2000:
+            sub_chunks = text_splitter.split_documents([doc])
+            for i, sub in enumerate(sub_chunks):
+                sub.metadata.update(doc.metadata)
+                sub.metadata["chunk_type"] = "sub_chunk"
+                sub.metadata["sub_chunk_index"] = i
+            final_chunks.extend(sub_chunks)
+        else:
+            final_chunks.append(doc)
+
+    return final_chunks
 
 def retrieve_node(state: GraphState) -> GraphState:
     if runtime.faiss_index is None:
         return {**state, "answer": "Please upload and process a document first."}
 
     question = state["question"]
+
     expanded_query = f"""
     {question}
 
-    Search specifically for definitions, clauses, regulation numbers, named terms,
-    calculation rules, tables, and exact phrases that may answer the question.
+    Search specifically for:
+    - definitions
+    - clauses and regulations
+    - tables and structured data
+    - figures, diagrams, and images
+    - exact phrases and references
     """
-    
+
     docs = runtime.ensemble_retriever(expanded_query, k=10)
-    
+    expanded_section_docs = expand_section_docs_from_toc(docs)
+    if expanded_section_docs:
+        docs = [doc for doc in docs if not is_toc_like(doc.page_content)] + expanded_section_docs
+
     context_blocks = []
+    retrieved_pages = []
+
     for doc in docs:
-        page = doc.metadata.get("page", "unknown")
-        source = doc.metadata.get("source", runtime.document_name or "document")
-        context_blocks.append({
-            "source": str(source),
-            "page": str(page),
-            "content": doc.page_content,
-            "relevance_score": doc.metadata.get("hybrid_score", 0)
-        })
-    
+        metadata = doc.metadata or {}   
+
+        page = metadata.get("page", "unknown")
+        source = metadata.get("source", runtime.document_name or "document")
+        score = metadata.get("hybrid_score", 0)
+        if page != "unknown":
+            retrieved_pages.append(page)
+
+            # ✅ NOW safe to use metadata
+        if metadata.get("is_table"):
+            score += 0.2   # boost table chunks
+
+        # 🔥 CASE 1: IMAGE HANDLING
+        if metadata.get("type") == "image":
+            context_blocks.append({
+                "source": str(source),
+                "page": str(page),
+                "type": "image",
+                "image_base64": metadata.get("image_base64"),
+                "image_mime": metadata.get("image_mime", "image/png"),
+                "relevance_score": score
+            })
+
+        # 🔥 CASE 2: TABLE HANDLING
+        elif metadata.get("is_table"):
+            context_blocks.append({
+                "source": str(source),
+                "page": str(page),
+                "type": "table",
+                "content": doc.page_content,
+                "relevance_score": score
+            })
+
+        # 🔥 CASE 3: NORMAL TEXT
+        else:
+            context_blocks.append({
+                "source": str(source),
+                "page": str(page),
+                "type": "text",
+                "content": doc.page_content,
+                "relevance_score": score
+            })
+
+    image_keys_added = set()
+
+    top_pages = set()
+
+    # only take top 3 most relevant chunks
+    for doc in docs[:3]:
+        page = doc.metadata.get("page")
+        if isinstance(page, int):
+            top_pages.add(page)
+
+    for page_key in top_pages:
+        try:
+            page_key = int(page)
+        except (TypeError, ValueError):
+            continue
+
+        for image_doc in runtime.page_images.get(page_key, []):
+            metadata = image_doc.metadata or {}
+            image_key = (page_key, metadata.get("image_index", 0), metadata.get("image_base64", "")[:32])
+            if image_key in image_keys_added:
+                continue
+
+            context_blocks.append({
+                "source": str(metadata.get("source", runtime.document_name or "document")),
+                "page": str(page_key),
+                "type": "image",
+                "image_base64": metadata.get("image_base64"),
+                "image_mime": metadata.get("image_mime", "image/png"),
+                "relevance_score": metadata.get("hybrid_score", 0),
+            })
+            image_keys_added.add(image_key)
+
+            if len(image_keys_added) >= 6:
+                break
+
+        if len(image_keys_added) >= 6:
+            break
+
     return {**state, "context": context_blocks}
 
 
@@ -243,54 +523,143 @@ def generate_node(state: GraphState) -> GraphState:
     if not state["context"]:
         return {**state, "answer": "No relevant content found in the document."}
 
-    context_str = "\n\n---\n\n".join(
-        [f"[Source: {c['source']}, Page: {c['page']}]\n{c['content']}" for c in state["context"]]
-    )
-    
-    prompt = f"""You are an intelligent assistant that answers user queries using the provided document context as the primary source of truth.
+    context_parts = []
 
-### Core Behavior
-- Base your answer strictly on the provided context.
-- Do not use external knowledge or assumptions.
-- Ensure the response is accurate, clear, and professionally written.
+    for c in state["context"]:
+        if c.get("type") == "image":
+            context_parts.append(
+                f"[Source: {c['source']}, Page: {c['page']}]\n"
+                "[IMAGE available for UI rendering]"
+            )
 
-### Answer Quality
-- Present the answer in a well-structured format (use headings, bullet points, or sections where appropriate).
-- Use clear and formal language, especially for regulatory, legal, or technical topics.
-- Avoid vague or conversational responses.
+        elif c.get("type") == "table":
+            context_parts.append(
+                f"[Source: {c['source']}, Page: {c['page']}]\n"
+                f"[TABLE]\n{c['content']}"
+            )
 
-### Completeness Handling
-- If the answer is fully available in the context:
-  → Provide a complete and confident response.
+        else:
+            context_parts.append(
+                f"[Source: {c['source']}, Page: {c['page']}]\n"
+                f"{c['content']}"
+            )
 
-- If the answer is partially available:
-  → Provide all available details.
-  → Clearly state what information is missing from the context.
+    context_str = "\n\n---\n\n".join(context_parts)
 
-- If the answer is not available:
-  → Respond with: "I don't have enough information to answer that."
+    prompt = f"""You are an intelligent assistant that answers user queries strictly using the provided document context as the primary source of truth.
 
-### Faithfulness Rules
-- Do not hallucinate or infer missing details.
-- Do not expand beyond what is explicitly supported.
-- Do not modify numerical values, percentages, dates, or definitions.
+========================
+CORE PRINCIPLES
+========================
 
-### Clarity Enhancements
-- When listing schemes, regulations, or components:
-  → Break them into numbered or titled sections.
-- When definitions are present:
-  → Present them clearly and distinctly.
-- When multiple components exist:
-  → Explain each component separately.
+1. USE ONLY CONTEXT  
+- Do not assume or infer missing information  
+- If the answer is not present, respond with:  
+  "I don't have enough information in the document to answer that."
 
-### Output Style
-- Keep the response concise but complete.
-- Prioritize readability and logical flow."
+2. FAITHFULNESS  
+- Do NOT modify, reinterpret, or summarize critical content  
+- Preserve original meaning, values, structure, and wording  
+- Do NOT hallucinate or fill gaps  
+
+3. COMPLETENESS  
+- If the relevant content is long, return it fully  
+- Do NOT shorten or compress important sections  
+- Include all necessary parts for clarity  
+
+========================
+STRUCTURE HANDLING (VERY IMPORTANT)
+========================
+
+You must preserve and reconstruct the structure of the document wherever applicable:
+
+1. TABLES  
+- If any part of the context contains tabular or semi-tabular data:
+  → Reconstruct it into a clean table format  
+  → Preserve all rows and columns  
+  → Do NOT summarize or convert into paragraphs  
+  → If multiple tables exist, present each separately  
+  → Include table title (if available)  
+
+2. SECTIONS & CLAUSES  
+- Maintain hierarchy (section, subsection, clause)  
+- Clearly label headings if present  
+
+3. LISTS  
+- Preserve bullet points or numbered lists exactly  
+
+========================
+VISUAL CONTENT HANDLING (CRITICAL)
+========================
+
+If the answer to the user’s query includes or is supported by:
+
+- diagrams  
+- figures  
+- images  
+- charts  
+- graphical representations  
+
+THEN:
+
+- The UI renders retrieved image data directly from the response payload.
+- Do not invent Markdown image URLs, broken image placeholders, or external image references.
+- ALWAYS include the visual content in the output if it exists in the context  
+- NEVER skip or ignore visual elements  
+- If image data (e.g., base64 or reference) is present → include it explicitly  
+- If the image cannot be rendered → provide a reference or placeholder indicating its presence  
+- Ensure visual content is presented alongside the relevant textual explanation  
+
+IMPORTANT RULE:  
+If a diagram, table, or visual element is part of the answer, it is MANDATORY to include it.  
+Do NOT provide text-only answers when visual support exists.
+add page numbers, source references, and clearly associate them with the content they support.
+
+========================
+PAGE & SOURCE INFORMATION
+========================
+
+- Always include page numbers if available  
+- Mention source identifiers if present  
+- Keep references clearly associated with content  
+
+========================
+OUTPUT RULES
+========================
+
+- Prefer structured output over narrative text  
+- Use headings, tables, and lists where applicable  
+- Do NOT mix unrelated sections  
+- Do NOT generate generic summaries when structured or visual data exists  
+- If multiple relevant sections exist, present all clearly  
+
+========================
+DECISION LOGIC
+========================
+
+Follow this order:
+
+1. Find exact match in context  
+2. If structured data exists → return structured (table/list/section)  
+3. If visual content exists → include it  
+4. If unstructured text → return complete relevant portion  
+5. If partial info → return available + clearly mention missing  
+6. If no info → say "I don't have enough information in the document"
+
+========================
+STYLE
+========================
+
+- Clear, formal, and readable  
+- Structured > descriptive  
+- Complete > summarized  
+- Visual + text combination preferred when available  
+ 
 
 Context:
 {context_str}
 
-Question: {state["question"]}
+Question: {state["question"]}   
 
 Answer:"""
 
@@ -367,15 +736,26 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
 
     try:
         documents = load_documents(tmp_path, file.filename)
+        for document in documents:
+            document.metadata["source"] = file.filename
+        image_docs = extract_images_from_pdf(tmp_path) if suffix.lower() == ".pdf" else []
+        runtime.page_images = {}
+        for image_doc in image_docs:
+            image_doc.metadata["source"] = file.filename
+            page = image_doc.metadata.get("page")
+            if isinstance(page, int):
+                runtime.page_images.setdefault(page, []).append(image_doc)
         if not documents:
             raise HTTPException(status_code=400, detail="No text could be extracted from the document.")
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1800,
-            chunk_overlap=350,
-            separators=["\n\n", "\n", ". ", "; ", " ", ""],
-        )
-        chunks = text_splitter.split_documents(documents)
+        # text_splitter = RecursiveCharacterTextSplitter(
+        #     chunk_size=1800,
+        #     chunk_overlap=350,
+        #     separators=["\n\n", "\n", ". ", "; ", " ", ""],
+        # )
+        # chunks = text_splitter.split_documents(documents)
+        chunks = hybrid_chunking(documents)
+
         if not chunks:
             raise HTTPException(status_code=400, detail="Document did not produce any text chunks.")
 
