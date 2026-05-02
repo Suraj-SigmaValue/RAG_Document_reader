@@ -50,6 +50,11 @@ function MarkdownAnswer({ content }: { content: string }) {
 
             return <img src={src} alt={alt || ""} />;
           },
+          table: ({ children, ...props }) => (
+            <div className="table-frame">
+              <table {...props}>{children}</table>
+            </div>
+          ),
         }}
       >
         {content}
