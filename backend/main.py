@@ -25,12 +25,12 @@ from backend.prompt import RAG_PROMPT_TEMPLATE
 
 load_dotenv()
 
-RETRIEVAL_FAISS_K = 5
-RETRIEVAL_BM25_K = 5
-HYBRID_CANDIDATE_K = 10
-RERANK_TOP_K = 6
-PARENT_EXPAND_TOP_K = 2
-PARENT_EXPAND_MAX_EXTRA = 4
+RETRIEVAL_FAISS_K = 20
+RETRIEVAL_BM25_K = 20
+HYBRID_CANDIDATE_K = 40
+RERANK_TOP_K = 15
+PARENT_EXPAND_TOP_K = 6
+PARENT_EXPAND_MAX_EXTRA = 15
 MAX_CONTEXT_CHARS = 10000
 MAX_IMAGES = 4
 IMAGE_TOP_PAGES = 2
@@ -90,6 +90,7 @@ class GraphState(TypedDict):
     context: List[dict]
     answer: str
     retrieval_timing: Optional[dict]
+    token_usage: Optional[dict]
 
 def extract_images_from_pdf(file_path):
     doc = fitz.open(file_path)
@@ -211,32 +212,33 @@ def load_documents(file_path: str, filename: str) -> List[Document]:
 
     if extension == ".pdf":
         try:
+            from langchain_community.document_loaders import PyPDFLoader
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+
+            for doc in docs:
+                page = doc.metadata.get("page")
+                if isinstance(page, int):
+                    doc.metadata["page"] = page + 1
+
+            total_text = " ".join(doc.page_content for doc in docs)
+            if len(total_text.strip()) > 500:
+                runtime.loader_type = "pypdf"
+                return docs
+
+        except Exception as e:
+            print(f"PyPDFLoader failed: {e}")
+
+        try:
             docs = load_pdf_with_opendataloader(file_path)
             total_text = " ".join(doc.page_content for doc in docs)
             if len(total_text.strip()) > 500:
                 runtime.loader_type = "opendataloader"
                 return docs
-        except Exception as e:
-            print(f"OpenDataLoader failed: {e}")
-            pass
 
-        try:
-            from langchain_community.document_loaders import PyPDFLoader
-            loader = PyPDFLoader(file_path)
-            docs = loader.load()
-            for doc in docs:
-                metadata = doc.metadata or {}   # ✅ MUST come first
-                page = doc.metadata.get("page")
-                if isinstance(page, int):
-                    doc.metadata["page"] = page + 1
-            total_text = " ".join(doc.page_content for doc in docs)
-            if len(total_text.strip()) > 500:
-                runtime.loader_type = "pypdf"
-                return docs
         except Exception as e:
-            print(f"PyPDFLoader failed: {e}")
-            pass
-            
+            print(f"OpenDataLoader failed, skipped safely: {e}")
+
         runtime.loader_type = "ocr"
         return load_pdf_with_ocr(file_path)
 
@@ -763,14 +765,21 @@ def generate_node(state: GraphState) -> GraphState:
     response = llm.invoke(prompt)
 
     usage = response.response_metadata.get("token_usage", {})
+    current_usage = {"input": 0, "output": 0}
+    
     if usage:
-        runtime.total_llm_input_tokens += usage.get("prompt_tokens", 0)
-        runtime.total_llm_output_tokens += usage.get("completion_tokens", 0)
+        in_toks = usage.get("prompt_tokens", 0)
+        out_toks = usage.get("completion_tokens", 0)
     else:
-        runtime.total_llm_input_tokens += count_tokens(prompt, "gpt-4o-mini")
-        runtime.total_llm_output_tokens += count_tokens(response.content, "gpt-4o-mini")
+        in_toks = count_tokens(prompt, "gpt-4o-mini")
+        out_toks = count_tokens(response.content, "gpt-4o-mini")
+        
+    runtime.total_llm_input_tokens += in_toks
+    runtime.total_llm_output_tokens += out_toks
+    current_usage["input"] = in_toks
+    current_usage["output"] = out_toks
 
-    return {**state, "answer": response.content}
+    return {**state, "answer": response.content, "token_usage": current_usage}
 
 
 builder = StateGraph(GraphState)
@@ -892,10 +901,10 @@ def ask(request: AskRequest) -> AskResponse:
     if runtime.faiss_index is None:
         raise HTTPException(status_code=400, detail="Upload and process a document first.")
 
-    final_state = rag_graph.invoke({"question": question, "context": [], "answer": "", "retrieval_timing": None})
+    final_state = rag_graph.invoke({"question": question, "context": [], "answer": "", "retrieval_timing": None, "token_usage": None})
     return AskResponse(
         answer=final_state["answer"],
         chunks=final_state["context"],
-        token_usage=token_usage(),
+        token_usage=final_state.get("token_usage") or {"input": 0, "output": 0},
         retrieval_timing=final_state.get("retrieval_timing")
     )
