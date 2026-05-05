@@ -10,6 +10,8 @@ import tiktoken
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
 from langchain_community.document_loaders import Docx2txtLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -31,7 +33,7 @@ HYBRID_CANDIDATE_K = 40
 RERANK_TOP_K = 15
 PARENT_EXPAND_TOP_K = 6
 PARENT_EXPAND_MAX_EXTRA = 15
-MAX_CONTEXT_CHARS = 10000
+MAX_CONTEXT_CHARS = 25000
 MAX_IMAGES = 4
 IMAGE_TOP_PAGES = 2
 
@@ -907,4 +909,88 @@ def ask(request: AskRequest) -> AskResponse:
         chunks=final_state["context"],
         token_usage=final_state.get("token_usage") or {"input": 0, "output": 0},
         retrieval_timing=final_state.get("retrieval_timing")
+    )
+@app.post("/ask/stream")
+async def ask_stream(request: AskRequest):
+    require_openai_key()
+
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    if runtime.faiss_index is None:
+        raise HTTPException(status_code=400, detail="Upload and process a document first.")
+
+    async def generate():
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        loop = asyncio.get_event_loop()
+
+        # 1. Run retrieval in a thread (it's synchronous)
+        with ThreadPoolExecutor() as pool:
+            state = await loop.run_in_executor(
+                pool,
+                lambda: retrieve_node({
+                    "question": question,
+                    "context": [],
+                    "answer": "",
+                    "retrieval_timing": None,
+                    "token_usage": None,
+                })
+            )
+
+        context_blocks = state["context"]
+        retrieval_timing = state.get("retrieval_timing")
+
+        # 2. Build context string (mirrors generate_node logic)
+        context_parts = []
+        for c in context_blocks:
+            if c.get("type") == "image":
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n[IMAGE available for UI rendering]"
+                )
+            elif c.get("type") == "table":
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n[TABLE]\n{c['content']}"
+                )
+            else:
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n{c['content']}"
+                )
+
+        context_str = "\n\n---\n\n".join(context_parts)
+        prompt = RAG_PROMPT_TEMPLATE.format(context_str=context_str, question=question)
+
+        # 3. Stream LLM tokens
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            api_key=OPENAI_API_KEY,
+            streaming=True,
+        )
+
+        full_response = ""
+        in_toks = count_tokens(prompt, "gpt-4o-mini")
+
+        async for chunk in llm.astream(prompt):
+            token = chunk.content
+            if token:
+                full_response += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+        # 4. Final done event with metadata
+        out_toks = count_tokens(full_response, "gpt-4o-mini")
+        runtime.total_llm_input_tokens += in_toks
+        runtime.total_llm_output_tokens += out_toks
+
+        yield f"data: {json.dumps({'type': 'done', 'chunks': context_blocks, 'token_usage': {'input': in_toks, 'output': out_toks}, 'retrieval_timing': retrieval_timing})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )

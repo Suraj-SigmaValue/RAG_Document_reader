@@ -66,6 +66,98 @@ function chunkImageSrc(chunk: Chunk) {
   return `data:${chunk.image_mime || "image/png"};base64,${chunk.image_base64}`;
 }
 
+type GraphNodeId = "start" | "retrieve" | "generate" | "end";
+type PipelineDurations = Partial<Record<GraphNodeId, number>>;
+
+function formatDuration(ms?: number | null) {
+  if (ms == null) {
+    return "";
+  }
+
+  const seconds = ms / 1000;
+  if (seconds < 1) {
+    return "< 1s";
+  }
+
+  return `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
+}
+
+function PipelineGraph({
+  active,
+  ready,
+  durations,
+  totalDuration,
+}: {
+  active: GraphNodeId | null;
+  ready: boolean;
+  durations: PipelineDurations;
+  totalDuration: number | null;
+}) {
+  const nodes: { id: GraphNodeId; label: string; sub?: string }[] = [
+    { id: "start", label: "Start", sub: "Document ready" },
+    { id: "retrieve", label: "Retrieve", sub: "FAISS / BM25 / Rerank" },
+    { id: "generate", label: "Generate", sub: "gpt-4o-mini / temperature 0.2" },
+    { id: "end", label: "Complete", sub: "Answer delivered" },
+  ];
+  const activeIndex = active ? nodes.findIndex((node) => node.id === active) : -1;
+
+  return (
+    <div className="pipeline-graph" aria-label="LangGraph execution pipeline">
+      <div className="pipeline-heading">
+        <p className="pipeline-title">LangGraph Pipeline</p>
+        <span className="pipeline-state">
+          {totalDuration ? `Total ${formatDuration(totalDuration)}` : active ? "Running" : ready ? "Ready" : "Idle"}
+        </span>
+      </div>
+      <div className="pipeline-nodes">
+        {nodes.map((node, index) => {
+          const isActive = active === node.id;
+          const duration = durations[node.id];
+          const isComplete = duration != null || activeIndex > index;
+          const isReadyStart = !active && ready && node.id === "start";
+          const status = isActive && !isComplete ? "In progress" : isComplete ? "Complete" : isReadyStart ? "Ready" : "Waiting";
+
+          return (
+            <div
+              key={node.id}
+              className={[
+                "pipeline-step",
+                isActive ? "pipeline-step--active" : "",
+                isComplete ? "pipeline-step--complete" : "",
+                isReadyStart ? "pipeline-step--ready" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+            >
+              <span className="pipeline-marker" aria-hidden="true">
+                {isComplete ? "" : index + 1}
+              </span>
+              <div
+                className={[
+                  "pipeline-node",
+                  isActive ? "pipeline-node--active" : "",
+                  isComplete ? "pipeline-node--complete" : "",
+                  isReadyStart ? "pipeline-node--ready" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+              >
+                <span className="pipeline-node-topline">
+                  <span className="pipeline-node-label">{node.label}</span>
+                  <span className="pipeline-node-status">
+                    {duration != null ? formatDuration(duration) : status}
+                  </span>
+                </span>
+                <span className="pipeline-node-sub">{node.sub}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [question, setQuestion] = useState("");
@@ -73,6 +165,9 @@ export default function Home() {
   const [askResult, setAskResult] = useState<AskResult | null>(null);
   const [busy, setBusy] = useState<"upload" | "ask" | null>(null);
   const [error, setError] = useState("");
+  const [activeNode, setActiveNode] = useState<GraphNodeId | null>(null);
+  const [stageDurations, setStageDurations] = useState<PipelineDurations>({});
+  const [totalDuration, setTotalDuration] = useState<number | null>(null);
 
   const tokenUsage = useMemo<TokenUsage>(() => {
     return askResult?.token_usage || uploadResult?.token_usage || { input: 0, output: 0 };
@@ -101,6 +196,9 @@ export default function Home() {
     setBusy("upload");
     setError("");
     setAskResult(null);
+    setActiveNode(null);
+    setStageDurations({});
+    setTotalDuration(null);
 
     const formData = new FormData();
     formData.append("file", file);
@@ -132,9 +230,17 @@ export default function Home() {
 
     setBusy("ask");
     setError("");
+    setStageDurations({});
+    setTotalDuration(null);
+    setActiveNode("start");
 
     try {
-      const response = await fetch(`${API_BASE_URL}/ask`, {
+      const totalStartedAt = performance.now();
+      const retrieveStartedAt = performance.now();
+      setStageDurations((prev) => ({ ...prev, start: retrieveStartedAt - totalStartedAt }));
+      setActiveNode("retrieve");
+
+      const response = await fetch(`${API_BASE_URL}/ask/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -146,9 +252,79 @@ export default function Home() {
         throw new Error(await parseError(response));
       }
 
-      setAskResult(await response.json());
+      const generateStartedAt = performance.now();
+      setStageDurations((prev) => ({ ...prev, retrieve: generateStartedAt - retrieveStartedAt }));
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      if (!reader) throw new Error("No response body");
+
+      setActiveNode("generate");
+      let fullAnswer = "";
+
+      setAskResult({ answer: "", chunks: [], token_usage: { input: 0, output: 0 } });
+
+      let buffer = "";
+      let completed = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const message = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          
+          const lines = message.split("\n");
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const dataStr = line.replace("data: ", "").trim();
+              if (!dataStr) continue;
+
+              try {
+                const data = JSON.parse(dataStr);
+                if (data.type === "token") {
+                  fullAnswer += data.content;
+                  setAskResult((prev) => prev ? { ...prev, answer: fullAnswer } : null);
+                } else if (data.type === "done") {
+                  const completeStartedAt = performance.now();
+                  setAskResult({
+                    answer: fullAnswer,
+                    chunks: data.chunks,
+                    token_usage: data.token_usage,
+                  });
+                  const completedAt = performance.now();
+                  setStageDurations((prev) => ({
+                    ...prev,
+                    generate: completeStartedAt - generateStartedAt,
+                    end: completedAt - completeStartedAt,
+                  }));
+                  setTotalDuration(completedAt - totalStartedAt);
+                  setActiveNode("end");
+                  completed = true;
+                }
+              } catch (e) {
+                console.error("Failed to parse SSE line", dataStr);
+              }
+            }
+          }
+          
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+
+      if (!completed) {
+        const completedAt = performance.now();
+        setStageDurations((prev) => ({ ...prev, generate: completedAt - generateStartedAt, end: 0 }));
+        setTotalDuration(completedAt - totalStartedAt);
+        setActiveNode("end");
+      }
     } catch (err) {
       setError(err instanceof Error ? `${err.message} (${API_BASE_URL})` : `Question failed. (${API_BASE_URL})`);
+      setActiveNode(null);
     } finally {
       setBusy(null);
     }
@@ -200,6 +376,13 @@ export default function Home() {
               </div>
             </dl>
           ) : null}
+
+          <PipelineGraph
+            active={activeNode}
+            ready={Boolean(uploadResult)}
+            durations={stageDurations}
+            totalDuration={totalDuration}
+          />
         </aside>
 
         <section className="panel reader">
