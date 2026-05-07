@@ -97,7 +97,8 @@ High-level workflow:
 |-- build_documentation.py
 |-- Documentation.docx
 |-- Documentation.pdf
-|-- requirements.txt
+|-- backend/
+|   `-- requirements.txt
 `-- README.md
 ```
 
@@ -140,7 +141,7 @@ From the project root:
 
 ```powershell
 .\venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 uvicorn backend.main:app --reload --port 8080
 ```
 
