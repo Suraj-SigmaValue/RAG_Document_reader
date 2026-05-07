@@ -1,10 +1,10 @@
 :root {
-  --bg: #f4f6f8;
-  --surface: #ffffff;
+  --bg: #b5aed4;
+  --surface: #e4d6d6;
   --surface-muted: #f8fafc;
   --surface-strong: #eef2f6;
   --text: #172033;
-  --muted: #667085;
+  --muted: #0a0a0a;
   --line: #d8dee8;
   --line-strong: #c2cada;
   --accent: #1f5eff;
@@ -509,4 +509,216 @@ details[open] summary::after {
   .answer-markdown table {
     min-width: 540px;
   }
+}
+
+.pipeline-graph {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.pipeline-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.pipeline-title {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pipeline-state {
+  border: 1px solid #d9e2f2;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #475467;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 6px 9px;
+}
+
+.pipeline-nodes {
+  position: relative;
+  display: grid;
+  gap: 12px;
+}
+
+.pipeline-nodes::before {
+  content: "";
+  position: absolute;
+  top: 18px;
+  bottom: 18px;
+  left: 15px;
+  width: 2px;
+  border-radius: 999px;
+  background: #dfe6f0;
+}
+
+.pipeline-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.pipeline-marker {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #667085;
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: 0 0 0 4px #ffffff;
+}
+
+.pipeline-step--complete .pipeline-marker {
+  border-color: #98a8c0;
+  background: #253044;
+  color: #ffffff;
+}
+
+.pipeline-step--complete .pipeline-marker::before {
+  content: "";
+  width: 9px;
+  height: 5px;
+  border-bottom: 2px solid currentColor;
+  border-left: 2px solid currentColor;
+  transform: rotate(-45deg) translate(1px, -1px);
+}
+
+.pipeline-step--active .pipeline-marker {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 0 0 4px #ffffff, 0 0 0 8px rgba(31, 94, 255, 0.12);
+}
+
+.pipeline-step--ready .pipeline-marker {
+  border-color: #8ba4d6;
+  background: #edf3ff;
+  color: var(--accent);
+}
+
+.pipeline-node {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #d9e2f2;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #ffffff 0%, #f9fbfd 100%);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  box-shadow: 0 8px 18px rgba(16, 24, 40, 0.04);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.pipeline-node--active {
+  border-color: var(--accent);
+  background: linear-gradient(180deg, #ffffff 0%, #f2f6ff 100%);
+  box-shadow: 0 10px 24px rgba(31, 94, 255, 0.14);
+  transform: translateY(-1px);
+}
+
+.pipeline-node--ready {
+  border-color: #b8c9ef;
+  background: #f7faff;
+}
+
+.pipeline-node--complete {
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+.pipeline-node-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pipeline-node-label {
+  color: #182230;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.pipeline-node--active .pipeline-node-label {
+  color: var(--accent);
+}
+
+.pipeline-node-status {
+  flex: 0 0 auto;
+  color: #667085;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.pipeline-node--active .pipeline-node-status {
+  color: var(--accent);
+}
+
+.pipeline-node--ready .pipeline-node-status {
+  color: var(--accent);
+}
+
+.pipeline-node--complete .pipeline-node-status {
+  color: #475467;
+}
+
+.pipeline-node-sub {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 14px; /* reduce gap below header */
+}
+
+.logo-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo {
+  width: 220px;
+  height: 48px;
+  object-fit: contain;
+}
+
+.topbar h1 {
+  margin: 0 0 4px;
+}
+
+.topbar p {
+  margin: 0;
+  line-height: 1.3;
 }

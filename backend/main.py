@@ -10,6 +10,8 @@ import tiktoken
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
 from langchain_community.document_loaders import Docx2txtLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -19,8 +21,21 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 import faiss
 import numpy as np
+import time
+
+from backend.prompt import RAG_PROMPT_TEMPLATE
 
 load_dotenv()
+
+RETRIEVAL_FAISS_K = 20
+RETRIEVAL_BM25_K = 20
+HYBRID_CANDIDATE_K = 40
+RERANK_TOP_K = 15
+PARENT_EXPAND_TOP_K = 6
+PARENT_EXPAND_MAX_EXTRA = 15
+MAX_CONTEXT_CHARS = 25000
+MAX_IMAGES = 4
+IMAGE_TOP_PAGES = 2
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 POPPLER_PATH = os.getenv("POPPLER_PATH", "")
@@ -46,6 +61,7 @@ class RagRuntime:
         self.total_llm_input_tokens = 0
         self.total_llm_output_tokens = 0
         self.embeddings = None
+        self.loader_type: Optional[str] = None
 
 
 runtime = RagRuntime()
@@ -68,12 +84,15 @@ class AskResponse(BaseModel):
     answer: str
     chunks: List[dict]
     token_usage: dict
+    retrieval_timing: Optional[dict] = None
 
 
 class GraphState(TypedDict):
     question: str
     context: List[dict]
     answer: str
+    retrieval_timing: Optional[dict]
+    token_usage: Optional[dict]
 
 def extract_images_from_pdf(file_path):
     doc = fitz.open(file_path)
@@ -141,6 +160,55 @@ def load_pdf_with_ocr(file_path: str) -> List[Document]:
         raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
 
 
+def load_pdf_with_opendataloader(file_path: str) -> List[Document]:
+    import opendataloader_pdf
+    import json
+    
+    result = opendataloader_pdf.convert(file_path, format="markdown,json")
+    
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except Exception:
+            data = []
+    else:
+        data = result
+        
+    docs = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and "elements" in data:
+        items = data["elements"]
+    elif isinstance(data, dict) and "pages" in data:
+        items = data["pages"]
+    elif isinstance(data, dict):
+        items = [data]
+    else:
+        items = []
+        
+    for item in items:
+        md_content = item.get("markdown") or item.get("text") or item.get("content") or ""
+        if not md_content:
+            continue
+            
+        page_num = item.get("page", item.get("page_number", 1))
+        
+        docs.append(Document(
+            page_content=md_content,
+            metadata={
+                "page": page_num,
+                "source": "opendataloader",
+                "type": "text",
+                "section": item.get("section_id") or item.get("section"),
+                "title": item.get("section_title") or item.get("title"),
+                "bbox": item.get("bbox") or item.get("bounding_box"),
+                "is_table": is_table_like(md_content)
+            }
+        ))
+        
+    return docs
+
+
 def load_documents(file_path: str, filename: str) -> List[Document]:
     extension = os.path.splitext(filename)[1].lower()
 
@@ -149,19 +217,35 @@ def load_documents(file_path: str, filename: str) -> List[Document]:
             from langchain_community.document_loaders import PyPDFLoader
             loader = PyPDFLoader(file_path)
             docs = loader.load()
+
             for doc in docs:
-                metadata = doc.metadata or {}   # ✅ MUST come first
                 page = doc.metadata.get("page")
                 if isinstance(page, int):
                     doc.metadata["page"] = page + 1
+
             total_text = " ".join(doc.page_content for doc in docs)
             if len(total_text.strip()) > 500:
+                runtime.loader_type = "pypdf"
                 return docs
-        except Exception:
-            pass
+
+        except Exception as e:
+            print(f"PyPDFLoader failed: {e}")
+
+        try:
+            docs = load_pdf_with_opendataloader(file_path)
+            total_text = " ".join(doc.page_content for doc in docs)
+            if len(total_text.strip()) > 500:
+                runtime.loader_type = "opendataloader"
+                return docs
+
+        except Exception as e:
+            print(f"OpenDataLoader failed, skipped safely: {e}")
+
+        runtime.loader_type = "ocr"
         return load_pdf_with_ocr(file_path)
 
     if extension == ".docx":
+        runtime.loader_type = "docx"
         return Docx2txtLoader(file_path).load()
 
     raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
@@ -200,10 +284,10 @@ def create_hybrid_retriever(chunks: List[Document], vector_weight: float = 0.6, 
     
     # Create BM25 retriever
     bm25_retriever = BM25Retriever.from_documents(chunks, preprocess_func=preprocess_for_bm25)
-    bm25_retriever.k = 10
+    bm25_retriever.k = RETRIEVAL_BM25_K
     runtime.bm25_retriever = bm25_retriever
     
-    def hybrid_search(query: str, k: int = 10) -> List[Document]:
+    def hybrid_search(query: str, k: int = HYBRID_CANDIDATE_K) -> List[Document]:
         # Get BM25 results
         bm25_docs = bm25_retriever.invoke(query)
         
@@ -213,7 +297,7 @@ def create_hybrid_retriever(chunks: List[Document], vector_weight: float = 0.6, 
         faiss.normalize_L2(query_array)
         
         # Search FAISS index
-        distances, indices = runtime.faiss_index.search(query_array, k * 2)
+        distances, indices = runtime.faiss_index.search(query_array, RETRIEVAL_FAISS_K)
         
         # Get FAISS results
         faiss_docs = []
@@ -258,8 +342,18 @@ def is_table_like(text):
     if len(lines) < 3:
         return False
 
+    markdown_table = False
+    for i, line in enumerate(lines):
+        if "|" in line and i + 1 < len(lines):
+            next_line = lines[i+1]
+            if "|" in next_line and "---" in next_line:
+                markdown_table = True
+                break
+
     table_keywords = [
-        "table no", "sr. no", "occupancy"
+        "table", "schedule", "statement", "area", "rate", "cost", "amount", 
+        "fsi", "carpet", "built-up", "premium", "charges", "sr no", 
+        "description", "occupancy", "regulation"
     ]
 
     keyword_hit = any(k in text.lower() for k in table_keywords)
@@ -272,7 +366,7 @@ def is_table_like(text):
         if len(re.split(r"\s{2,}|\t", line)) >= 2
     )
 
-    return keyword_hit or numeric_ratio > 0.35 or column_like_lines >= 3
+    return markdown_table or keyword_hit or numeric_ratio > 0.35 or column_like_lines >= 3
 
 def is_toc_like(text: str) -> bool:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -338,6 +432,115 @@ def expand_section_docs_from_toc(docs: List[Document], max_extra: int = 18) -> L
     return expanded_docs
 
 
+def rerank_documents(question: str, docs: List[Document], max_docs: int = RERANK_TOP_K) -> List[Document]:
+    q_lower = question.lower()
+    q_words = set(re.findall(r'\w+', q_lower))
+    
+    table_keywords = {"table", "rate", "area", "cost", "fsi", "calculation", "statement", "schedule"}
+    has_table_intent = any(kw in q_words for kw in table_keywords)
+
+    for doc in docs:
+        score = doc.metadata.get("hybrid_score", 0)
+        content_lower = doc.page_content.lower()
+        title_lower = str(doc.metadata.get("title", "")).lower()
+        section_lower = str(doc.metadata.get("section", "")).lower()
+        
+        content_words = set(re.findall(r'\w+', content_lower))
+        if content_words:
+            overlap = len(q_words & content_words)
+            score += overlap * 0.05
+        
+        if any(qw in title_lower or qw in section_lower for qw in q_words if len(qw) > 3):
+            score += 0.3
+            
+        if has_table_intent and doc.metadata.get("is_table"):
+            score += 0.5
+            
+        if doc.metadata.get("page") is not None:
+            score += 0.1
+        if doc.metadata.get("section") is not None:
+            score += 0.1
+            
+        if is_toc_like(doc.page_content):
+            score -= 0.5
+            
+        doc.metadata["rerank_score"] = score
+        
+    reranked = sorted(docs, key=lambda x: x.metadata.get("rerank_score", 0), reverse=True)
+    return reranked[:max_docs]
+
+
+def expand_parent_sections(reranked_docs: List[Document]) -> List[Document]:
+    expanded = list(reranked_docs)
+    seen_ids = {doc.page_content[:100] for doc in expanded}
+    
+    extra_added = 0
+    
+    for doc in reranked_docs[:PARENT_EXPAND_TOP_K]:
+        if extra_added >= PARENT_EXPAND_MAX_EXTRA:
+            break
+            
+        if len(doc.page_content) > 1500:
+            continue
+            
+        section = doc.metadata.get("section")
+        parent_section = doc.metadata.get("parent_section")
+        
+        target_sections = set()
+        if section: target_sections.add(section)
+        if parent_section: target_sections.add(parent_section)
+        
+        if not target_sections:
+            continue
+            
+        for chunk in runtime.chunks:
+            if extra_added >= PARENT_EXPAND_MAX_EXTRA:
+                break
+                
+            chunk_sec = chunk.metadata.get("section")
+            chunk_parent = chunk.metadata.get("parent_section")
+            
+            if chunk_sec in target_sections or chunk_parent in target_sections:
+                chunk_id = chunk.page_content[:100]
+                if chunk_id not in seen_ids:
+                    expanded.append(chunk)
+                    seen_ids.add(chunk_id)
+                    extra_added += 1
+                    
+    return expanded
+
+
+def compress_context(question: str, docs: List[Document]) -> List[Document]:
+    compressed_docs = []
+    q_words = set(re.findall(r'\w+', question.lower()))
+    
+    total_chars = 0
+    
+    for doc in docs:
+        if total_chars >= MAX_CONTEXT_CHARS:
+            break
+            
+        if doc.metadata.get("is_table") or doc.metadata.get("type") == "image":
+            compressed_content = doc.page_content
+        else:
+            paragraphs = doc.page_content.split("\n\n")
+            kept_paragraphs = []
+            for p in paragraphs:
+                p_words = set(re.findall(r'\w+', p.lower()))
+                if len(q_words & p_words) > 0 or len(p) < 50:
+                    kept_paragraphs.append(p)
+                    
+            compressed_content = "\n\n".join(kept_paragraphs)
+            if len(compressed_content) < len(doc.page_content) * 0.2:
+                compressed_content = doc.page_content
+                
+        new_doc = Document(page_content=compressed_content, metadata=doc.metadata.copy())
+        compressed_docs.append(new_doc)
+        total_chars += len(compressed_content)
+        
+    return compressed_docs
+
+
 def structure_based_split(documents):
     structured_chunks = []
 
@@ -366,6 +569,11 @@ def structure_based_split(documents):
             section_id = match.group(1) if match else None
             title = match.group(3)[:100] if match else None
 
+            parent_section = None
+            if section_id and "." in section_id:
+                parts = section_id.split(".")
+                parent_section = ".".join(parts[:-1])
+
             structured_chunks.append(
                 Document(
                     page_content=sec,
@@ -373,6 +581,7 @@ def structure_based_split(documents):
                         "page": page,
                         "source": doc.metadata.get("source", runtime.document_name or "document"),
                         "section": section_id,
+                        "parent_section": parent_section,
                         "title": title,
                         "chunk_type": "section",
                         "is_table": is_table_like(sec) 
@@ -403,6 +612,7 @@ def hybrid_chunking(documents):
                 sub.metadata.update(doc.metadata)
                 sub.metadata["chunk_type"] = "sub_chunk"
                 sub.metadata["sub_chunk_index"] = i
+                sub.metadata["parent_section"] = doc.metadata.get("parent_section")
             final_chunks.extend(sub_chunks)
         else:
             final_chunks.append(doc)
@@ -410,6 +620,9 @@ def hybrid_chunking(documents):
     return final_chunks
 
 def retrieve_node(state: GraphState) -> GraphState:
+    timing = {}
+    t0 = time.perf_counter()
+
     if runtime.faiss_index is None:
         return {**state, "answer": "Please upload and process a document first."}
 
@@ -426,71 +639,67 @@ def retrieve_node(state: GraphState) -> GraphState:
     - exact phrases and references
     """
 
-    docs = runtime.ensemble_retriever(expanded_query, k=10)
-    expanded_section_docs = expand_section_docs_from_toc(docs)
-    if expanded_section_docs:
-        docs = [doc for doc in docs if not is_toc_like(doc.page_content)] + expanded_section_docs
+    # 1. Hybrid Search
+    t_start = time.perf_counter()
+    docs = runtime.ensemble_retriever(expanded_query, k=HYBRID_CANDIDATE_K)
+    timing['hybrid_retrieval_ms'] = (time.perf_counter() - t_start) * 1000
+
+    # 2. Rerank
+    t_start = time.perf_counter()
+    reranked_docs = rerank_documents(question, docs, max_docs=RERANK_TOP_K)
+    timing['rerank_ms'] = (time.perf_counter() - t_start) * 1000
+
+    # 3. Parent Expansion
+    t_start = time.perf_counter()
+    expanded_docs = expand_parent_sections(reranked_docs)
+    timing['parent_expansion_ms'] = (time.perf_counter() - t_start) * 1000
+
+    # 4. Contextual Compression
+    t_start = time.perf_counter()
+    compressed_docs = compress_context(question, expanded_docs)
+    timing['compression_ms'] = (time.perf_counter() - t_start) * 1000
 
     context_blocks = []
-    retrieved_pages = []
+    top_pages = set()
 
-    for doc in docs:
-        metadata = doc.metadata or {}   
-
+    for i, doc in enumerate(compressed_docs):
+        metadata = doc.metadata or {}
         page = metadata.get("page", "unknown")
         source = metadata.get("source", runtime.document_name or "document")
         score = metadata.get("hybrid_score", 0)
-        if page != "unknown":
-            retrieved_pages.append(page)
-
-            # ✅ NOW safe to use metadata
+        rerank_score = metadata.get("rerank_score", 0)
+        
+        doc_type = metadata.get("type", "text")
         if metadata.get("is_table"):
-            score += 0.2   # boost table chunks
+            doc_type = "table"
 
-        # 🔥 CASE 1: IMAGE HANDLING
-        if metadata.get("type") == "image":
-            context_blocks.append({
-                "source": str(source),
-                "page": str(page),
-                "type": "image",
-                "image_base64": metadata.get("image_base64"),
-                "image_mime": metadata.get("image_mime", "image/png"),
-                "relevance_score": score
-            })
-
-        # 🔥 CASE 2: TABLE HANDLING
-        elif metadata.get("is_table"):
-            context_blocks.append({
-                "source": str(source),
-                "page": str(page),
-                "type": "table",
-                "content": doc.page_content,
-                "relevance_score": score
-            })
-
-        # 🔥 CASE 3: NORMAL TEXT
-        else:
-            context_blocks.append({
-                "source": str(source),
-                "page": str(page),
-                "type": "text",
-                "content": doc.page_content,
-                "relevance_score": score
-            })
-
-    image_keys_added = set()
-
-    top_pages = set()
-
-    # only take top 3 most relevant chunks
-    for doc in docs[:3]:
-        page = doc.metadata.get("page")
-        if isinstance(page, int):
+        if page != "unknown" and doc_type != "image" and i < IMAGE_TOP_PAGES:
             top_pages.add(page)
 
+        block = {
+            "source": str(source),
+            "page": str(page),
+            "section": str(metadata.get("section", "")),
+            "title": str(metadata.get("title", "")),
+            "type": doc_type,
+            "chunk_type": str(metadata.get("chunk_type", "")),
+            "relevance_score": score,
+            "rerank_score": rerank_score
+        }
+        
+        if doc_type == "image":
+            block["image_base64"] = metadata.get("image_base64")
+            block["image_mime"] = metadata.get("image_mime", "image/png")
+        else:
+            block["content"] = doc.page_content
+
+        context_blocks.append(block)
+
+    # 5. Image Attachment
+    image_keys_added = set()
     for page_key in top_pages:
         try:
-            page_key = int(page)
+            page_key = int(page_key)
         except (TypeError, ValueError):
             continue
 
@@ -507,16 +716,22 @@ def retrieve_node(state: GraphState) -> GraphState:
                 "image_base64": metadata.get("image_base64"),
                 "image_mime": metadata.get("image_mime", "image/png"),
                 "relevance_score": metadata.get("hybrid_score", 0),
+                "rerank_score": 0,
+                "section": "",
+                "title": "",
+                "chunk_type": "image"
             })
             image_keys_added.add(image_key)
 
-            if len(image_keys_added) >= 6:
+            if len(image_keys_added) >= MAX_IMAGES:
                 break
 
-        if len(image_keys_added) >= 6:
+        if len(image_keys_added) >= MAX_IMAGES:
             break
 
-    return {**state, "context": context_blocks}
+    timing['total_retrieval_ms'] = (time.perf_counter() - t0) * 1000
+
+    return {**state, "context": context_blocks, "retrieval_timing": timing}
 
 
 def generate_node(state: GraphState) -> GraphState:
@@ -644,14 +859,21 @@ Answer:"""
     response = llm.invoke(prompt)
 
     usage = response.response_metadata.get("token_usage", {})
+    current_usage = {"input": 0, "output": 0}
+    
     if usage:
-        runtime.total_llm_input_tokens += usage.get("prompt_tokens", 0)
-        runtime.total_llm_output_tokens += usage.get("completion_tokens", 0)
+        in_toks = usage.get("prompt_tokens", 0)
+        out_toks = usage.get("completion_tokens", 0)
     else:
-        runtime.total_llm_input_tokens += count_tokens(prompt, "gpt-4o-mini")
-        runtime.total_llm_output_tokens += count_tokens(response.content, "gpt-4o-mini")
+        in_toks = count_tokens(prompt, "gpt-4o-mini")
+        out_toks = count_tokens(response.content, "gpt-4o-mini")
+        
+    runtime.total_llm_input_tokens += in_toks
+    runtime.total_llm_output_tokens += out_toks
+    current_usage["input"] = in_toks
+    current_usage["output"] = out_toks
 
-    return {**state, "answer": response.content}
+    return {**state, "answer": response.content, "token_usage": current_usage}
 
 
 builder = StateGraph(GraphState)
@@ -695,7 +917,13 @@ def status() -> dict:
         "document_name": runtime.document_name,
         "chunk_count": runtime.chunk_count,
         "token_usage": token_usage(),
-        "retrieval_method": "hybrid (FAISS + BM25)"
+        "retrieval_method": "hybrid (FAISS + BM25)",
+        "has_faiss": runtime.faiss_index is not None,
+        "has_bm25": runtime.bm25_retriever is not None,
+        "has_images": len(runtime.page_images) > 0,
+        "reranker_type": "lightweight_rule_based",
+        "compression_type": "rule_based",
+        "loader_type": runtime.loader_type or "unknown"
     }
 
 
@@ -767,9 +995,94 @@ def ask(request: AskRequest) -> AskResponse:
     if runtime.faiss_index is None:
         raise HTTPException(status_code=400, detail="Upload and process a document first.")
 
-    final_state = rag_graph.invoke({"question": question, "context": [], "answer": ""})
+    final_state = rag_graph.invoke({"question": question, "context": [], "answer": "", "retrieval_timing": None, "token_usage": None})
     return AskResponse(
         answer=final_state["answer"],
         chunks=final_state["context"],
-        token_usage=token_usage(),
+        token_usage=final_state.get("token_usage") or {"input": 0, "output": 0},
+        retrieval_timing=final_state.get("retrieval_timing")
+    )
+@app.post("/ask/stream")
+async def ask_stream(request: AskRequest):
+    require_openai_key()
+
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    if runtime.faiss_index is None:
+        raise HTTPException(status_code=400, detail="Upload and process a document first.")
+
+    async def generate():
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        loop = asyncio.get_event_loop()
+
+        # 1. Run retrieval in a thread (it's synchronous)
+        with ThreadPoolExecutor() as pool:
+            state = await loop.run_in_executor(
+                pool,
+                lambda: retrieve_node({
+                    "question": question,
+                    "context": [],
+                    "answer": "",
+                    "retrieval_timing": None,
+                    "token_usage": None,
+                })
+            )
+
+        context_blocks = state["context"]
+        retrieval_timing = state.get("retrieval_timing")
+
+        # 2. Build context string (mirrors generate_node logic)
+        context_parts = []
+        for c in context_blocks:
+            if c.get("type") == "image":
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n[IMAGE available for UI rendering]"
+                )
+            elif c.get("type") == "table":
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n[TABLE]\n{c['content']}"
+                )
+            else:
+                context_parts.append(
+                    f"[Source: {c['source']}, Page: {c['page']}]\n{c['content']}"
+                )
+
+        context_str = "\n\n---\n\n".join(context_parts)
+        prompt = RAG_PROMPT_TEMPLATE.format(context_str=context_str, question=question)
+
+        # 3. Stream LLM tokens
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            api_key=OPENAI_API_KEY,
+            streaming=True,
+        )
+
+        full_response = ""
+        in_toks = count_tokens(prompt, "gpt-4o-mini")
+
+        async for chunk in llm.astream(prompt):
+            token = chunk.content
+            if token:
+                full_response += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+        # 4. Final done event with metadata
+        out_toks = count_tokens(full_response, "gpt-4o-mini")
+        runtime.total_llm_input_tokens += in_toks
+        runtime.total_llm_output_tokens += out_toks
+
+        yield f"data: {json.dumps({'type': 'done', 'chunks': context_blocks, 'token_usage': {'input': in_toks, 'output': out_toks}, 'retrieval_timing': retrieval_timing})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
