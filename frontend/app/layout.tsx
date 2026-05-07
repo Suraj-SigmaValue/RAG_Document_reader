@@ -5,8 +5,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "RAG Document Reader",
-  description: "Ask questions over PDF and DOCX documents.",
+  title: "User Input Data Agent",
+  description: "RAG framework to deal with User Input Data Agent.",
 };
 
 export default function RootLayout({

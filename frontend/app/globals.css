@@ -1,10 +1,10 @@
 :root {
-  --bg: #f4f6f8;
-  --surface: #ffffff;
+  --bg: #b5aed4;
+  --surface: #e4d6d6;
   --surface-muted: #f8fafc;
   --surface-strong: #eef2f6;
   --text: #172033;
-  --muted: #667085;
+  --muted: #0a0a0a;
   --line: #d8dee8;
   --line-strong: #c2cada;
   --accent: #1f5eff;
@@ -692,4 +692,33 @@ details[open] summary::after {
   font-weight: 500;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 14px; /* reduce gap below header */
+}
+
+.logo-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo {
+  width: 220px;
+  height: 48px;
+  object-fit: contain;
+}
+
+.topbar h1 {
+  margin: 0 0 4px;
+}
+
+.topbar p {
+  margin: 0;
+  line-height: 1.3;
 }
