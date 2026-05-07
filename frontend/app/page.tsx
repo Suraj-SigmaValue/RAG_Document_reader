@@ -1,6 +1,6 @@
-import { redirect } from "next/navigation";
+import DocumentReader from "../components/agent-one/DocumentReader";
 
 
 export default function HomePage() {
-  redirect("/user_input");
+  return <DocumentReader />;
 }
